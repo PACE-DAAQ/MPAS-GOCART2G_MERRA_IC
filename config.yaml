@@ -1,0 +1,21 @@
+# Configuration for satellite data processing
+in_dir: /glade/derecho/scratch/lacey/GitHubTemp/MERRA_TEST_DATA
+out_dir: /glade/derecho/scratch/lacey/GitHubTemp/MERRA_TEST_DATA/hourly
+pattern: MERRA2_400.inst3_3d_ae*.nc4
+hours: [0, 6, 12, 18]
+aer_files:
+  - MERRA2_aer:2024-10-15_00
+  - MERRA2_aer:2024-10-15_06
+  - MERRA2_aer:2024-10-15_12
+  - MERRA2_aer:2024-10-15_18
+ovp_file: /glade/derecho/scratch/lacey/GitHubTemp/MERRA_TEST_DATA/MERRA2_GMI.inst0_3d_ovp_Nv.20191015_1200z.nc4
+out_files:
+  - MERRA2:2024-10-15_00
+  - MERRA2:2024-10-15_06
+  - MERRA2:2024-10-15_12
+  - MERRA2:2024-10-15_18
+binary_output_names:
+  - MERRA2:2024-10-15_00
+  - MERRA2:2024-10-15_06
+  - MERRA2:2024-10-15_12
+  - MERRA2:2024-10-15_18
