@@ -1,72 +1,166 @@
-"""
-Main processing script for MPAS-GOCART2G_MERRA_IC
-"""
-import yaml
 import os
-from mpas_gocart2g_merra_ic import file_ops
+import sys
+import yaml
+import struct
+import numpy as np
+from netCDF4 import Dataset
+from datetime import datetime, timedelta
 
-def check_packages():
-    missing = []
-    try:
-        import numpy
-    except ImportError:
-        missing.append('numpy')
-    try:
-        import netCDF4
-    except ImportError:
-        missing.append('netCDF4')
-    try:
-        import yaml
-    except ImportError:
-        missing.append('pyyaml')
-    if missing:
-        print(f"Error: Missing required packages: {', '.join(missing)}")
-        print("Please activate the correct environment (e.g., conda activate npl-2025b)")
-        exit(1)
+def write_fortran_record(file_handle, *args):
+    """
+    Simulates a Fortran 'unformatted' write for WPS Intermediate files.
+    """
+    payload = b""
+    for val, fmt in args:
+        if 's' in fmt:
+            length = int(fmt.replace('s', ''))
+            payload += str(val).ljust(length)[:length].encode('ascii')
+        elif fmt == '?': 
+            payload += struct.pack('>i', 1 if val else 0)
+        elif fmt == 'b': 
+            payload += val
+        else:
+            payload += struct.pack(f'>{fmt}', val)
 
-def main(config_path=None):
-    if config_path is None:
-        config_path = "config.yaml"
+    record_size = len(payload)
+    file_handle.write(struct.pack('>i', record_size))
+    file_handle.write(payload)
+    file_handle.write(struct.pack('>i', record_size))
+
+def run_conversion(config_path='config.yaml'):
+    # 1. LOAD CONFIGURATION
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    
+    p = config['control_params']
+    species_map = config['species_map']
+    
+    # 2. SETUP TIME PARAMETERS
+    start_dt = datetime(p['start_year'], p['start_month'], p['start_day'], p['start_hour'])
+    total_intervals = p['num_days'] * (24 // p['interval_hr'])
+    
+    # Constants for WPS Header
+    IFV, IPROJ = 5, 0
+    EARTH_RADIUS = 6367470 * 0.001
+    IS_WIND_EARTH_REL = False
+    STARTLOC = 'SWCORNER'
 
-    # Subset time
-    file_ops.subset_time(
-        in_dir=config['in_dir'],
-        out_dir=config['out_dir'],
-        pattern=config.get('pattern', 'MERRA2_400.inst3_3d_ae*.nc4'),
-        hours=config.get('hours', [0, 6, 12, 18])
-    )
+    active_handles = {}
 
-    # Automate combine_files: generate aer_files and out_files from subsetting output
-    import glob
-    aer_files = []
-    out_files = []
-    for hour in config.get('hours', [0, 6, 12, 18]):
-        hh2 = f"{hour:02d}"
-        pattern = f"*_{hh2}Z.nc4"
-        files = [f for f in glob.glob(os.path.join(config['out_dir'], pattern)) if not os.path.basename(f).startswith('combined_')]
-        aer_files.extend(files)
-        for f in files:
-            out_name = os.path.basename(f).replace('.nc4', '')
-            out_files.append(os.path.join(config['out_dir'], f"{out_name}_with_ovp.nc4"))
+    current_dt = start_dt
+    for step in range(total_intervals):
+        hdate = current_dt.strftime("%Y-%m-%d_%H:00:00")
+        fname_out = f"{p['prefix_out']}{current_dt.strftime('%Y-%m-%d_%H')}"
+        
+        print(f"\n--- Processing Interval: {hdate} ---")
 
-    ovp_file = config['ovp_file']
-    file_ops.combine_files(
-        aer_files=aer_files,
-        ovp_file=ovp_file,
-        out_files=out_files
-    )
+        sfcpres, dpres = None, None
+        nlat, nlon, nlev = None, None, None
+        startlat, startlon, deltalat, deltalon = None, None, None, None
 
-    # Write MPAS binary files for each processed NetCDF file
-    binary_names = config.get('binary_output_names', [])
-    for ncfile, bin_name in zip(out_files, binary_names):
-        bin_out = os.path.join(config['out_dir'], bin_name)
-        print(f"Writing MPAS binary file: {bin_out} from {ncfile}")
-        file_ops.process_and_write_mpas_binary(ncfile, bin_out)
+        with open(fname_out, 'wb') as f_out:
+            for spc in species_map:
+                field = spc['target']
+                src_var = spc['source']
+                file_key = spc.get('file', 'prefix_in_1')
+            
+                key_index = file_key.split('_')[-1]
+                suffix_key = f"suffix_in_{key_index}"
+                file_suffix = p.get(suffix_key, ".nc4")
+                target_fname = f"{p[file_key]}{current_dt.strftime('%Y%m%d')}{file_suffix}"
+                
+                if file_key not in active_handles or active_handles[file_key]['name'] != target_fname:
+                    if file_key in active_handles:
+                        active_handles[file_key]['nc'].close()
+                    
+                    if os.path.exists(target_fname):
+                        print(f"  > Opening Source {file_key}: {os.path.basename(target_fname)}")
+                        active_handles[file_key] = {
+                            'nc': Dataset(target_fname, 'r'),
+                            'name': target_fname
+                        }
+                    else:
+                        print(f"  ! WARNING: File not found: {target_fname}")
+                        if file_key in active_handles: del active_handles[file_key]
+
+                if file_key in active_handles:
+                    nc = active_handles[file_key]['nc']
+                    
+                    if nlat is None:
+                        nlat, nlon, nlev = len(nc.dimensions['lat']), len(nc.dimensions['lon']), len(nc.dimensions['lev'])
+                        y1d, x1d = nc.variables['lat'][:], nc.variables['lon'][:]
+                        startlat, startlon = float(y1d[0]), float(x1d[0])
+                        deltalat, deltalon = float(y1d[1]-y1d[0]), float(x1d[1]-x1d[0])
+
+                    file_n_times = len(nc.dimensions['time'])
+                    t_idx = (current_dt.hour // p['interval_hr']) if file_n_times > 1 else 0
+                    
+                    if src_var in nc.variables:
+                        print(f"  ! Processing {src_var}")
+                        data = nc.variables[src_var][t_idx, :] * spc.get('weight', 1.0)
+                        is_3d = (data.ndim == 3)
+                        curr_nlev = data.shape[0] if is_3d else 1
+                    else:
+                        print(f"  ! Field {src_var} missing in {file_key}. Writing ZEROS.")
+                        is_3d = False if field in ["PS", "LWI"] else True
+                        curr_nlev = nlev if is_3d else 1
+                        data = np.zeros((nlat, nlon)) if not is_3d else np.zeros((nlev, nlat, nlon))
+                else:
+                    is_3d = False if field in ["PS", "LWI"] else True
+                    curr_nlev = nlev if nlev else 72
+                    data = np.zeros((nlat, nlon)) if not is_3d else np.zeros((curr_nlev, nlat, nlon))
+
+                levels = range(curr_nlev) if is_3d else [0]
+                for k in levels:
+                    kk = (curr_nlev - 1 - k) if is_3d else 0
+                    slab = (data[kk, :, :] if is_3d else data).astype('>f4')
+                    xlvl = float(k + 1)
+
+                    write_fortran_record(f_out, (IFV, 'i'))
+                    write_fortran_record(f_out, (hdate, '24s'), (0.0, 'f'), ("MERRA2", '32s'), 
+                                         (field, '9s'), (spc['units'], '25s'), (spc['desc'], '46s'), 
+                                         (xlvl, 'f'), (nlon, 'i'), (nlat, 'i'), (IPROJ, 'i'))
+                    write_fortran_record(f_out, (STARTLOC, '8s'), (startlat, 'f'), (startlon, 'f'), 
+                                         (deltalat, 'f'), (deltalon, 'f'), (EARTH_RADIUS, 'f'))
+                    write_fortran_record(f_out, (IS_WIND_EARTH_REL, '?'))  
+                    write_fortran_record(f_out, (slab.tobytes(), 'b'))     
+
+                if field == 'PS': sfcpres = data
+                if field == 'DPRES': dpres = data
+
+            # --- 6. CALCULATE AND WRITE 'PRES' (Layer Center Pressure) ---
+            # This happens AFTER the species loop finishes for the current interval
+            if dpres is not None:
+                print(f"  -> Calculating and writing 3D Pressure (PRES)")
+                pres_3d = np.zeros((nlev, nlat, nlon), dtype='f4')
+                ptop = 1.0  # Pa
+                
+                pres_3d[0, :, :] = ptop + 0.5 * dpres[0, :, :]
+                for k in range(1, nlev):
+                    pres_3d[k, :, :] = pres_3d[k-1, :, :] + 0.5 * (dpres[k-1, :, :] + dpres[k, :, :])
+
+                # Metadata for PRES
+                field_pres, units_pres = 'PRES', 'Pa'
+                desc_pres = 'Pressure center of layers'
+                map_src_pres = "Calculated from DELP"
+
+                for k in range(nlev):
+                    kk = (nlev - 1 - k)
+                    slab = pres_3d[kk, :, :].astype('>f4')
+                    xlvl = float(k + 1)
+
+                    write_fortran_record(f_out, (IFV, 'i'))
+                    write_fortran_record(f_out, (hdate, '24s'), (0.0, 'f'), (map_src_pres, '32s'), 
+                                         (field_pres, '9s'), (units_pres, '25s'), (desc_pres, '46s'), 
+                                         (xlvl, 'f'), (nlon, 'i'), (nlat, 'i'), (IPROJ, 'i'))
+                    write_fortran_record(f_out, (STARTLOC, '8s'), (startlat, 'f'), (startlon, 'f'), 
+                                         (deltalat, 'f'), (deltalon, 'f'), (EARTH_RADIUS, 'f'))
+                    write_fortran_record(f_out, (IS_WIND_EARTH_REL, '?'))  
+                    write_fortran_record(f_out, (slab.tobytes(), 'b'))
+
+        current_dt += timedelta(hours=p['interval_hr'])
+
+    for h in active_handles.values(): h['nc'].close()
 
 if __name__ == "__main__":
-    check_packages()
-    import sys
-    config_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    main(config_arg)
+    run_conversion()
